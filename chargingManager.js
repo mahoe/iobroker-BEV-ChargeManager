@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-var loading_active, current_charge_amps, interval, current_power,
+var counter, loading_active, current_charge_amps, interval, current_power,
     power_available, debug_output_counter, new_charge_amps,
     old_charge_power, charge_on_hold, start_load_manager,
     loading_complete,startup_turns, step_down_power_calculated,
@@ -26,7 +26,8 @@ var loading_active, current_charge_amps, interval, current_power,
     DATA_POINT_TESLA_CHARGE_AMPS, DATA_POINT_TESLA_CHARGE_CABEL,
     CONTROL_TESLA_CHARGE_START, CONTROL_TESLA_CHARGE_STOP,
     DATA_POINT_TESLA_CHARGING_STATE, FRITZBOX_TESLA_WLAN_ACTIVE,
-    MAX_CHARGE_AMPS, MIN_CHARGE_AMPS, CONTROL_TESLA_CHARGE_AMPS;
+    MAX_CHARGE_AMPS, MIN_CHARGE_AMPS, KEEP_MINIMUM_AMPS,
+    CONTROL_TESLA_CHARGE_AMPS;
 
 /** Simply choose a "profile" you like by uncommenting one of the next blocks! */
 /* normal charging without import */
@@ -38,10 +39,12 @@ LOAD_POWER_DOWN = 350;              // step down the current
 */
 
 /* riding on the edge */ 
-MIN_CURRENT_POWER = 2600;
-MIN_POWER_AVAILABLE = 2100;
-LOAD_POWER_UP = 1000;
+MIN_CURRENT_POWER = 2750;
+MIN_POWER_AVAILABLE = 2450;
+LOAD_POWER_UP = 800;
 LOAD_POWER_DOWN = 0;
+// 0 - stop charging; >=3 keep it charging even the available power is less than zero
+KEEP_MINIMUM_AMPS = 0;
 /** END of "profiles" */
 
 MIN_CHARGE_AMPS = 3;
@@ -79,6 +82,7 @@ FRITZBOX_TESLA_WLAN_ACTIVE = "fb-checkpresence.0.fb-devices.Tesla-Model-3.active
 
 start_load_manager = true;
 loading_active = false;    
+counter = 0;
 
 /** enable the load manager at sunrise */
 schedule({astro: "sunriseEnd", shift: 0}, async function () {
@@ -92,16 +96,67 @@ schedule({astro: "sunset", shift: 0}, async function () {
     console.log("I'll go to sleep now.");
 });
 
+schedule("*/2 * * * *", runEveryTwoMinutes);
+
+function runEveryTwoMinutes() {
+  if(loading_active || !start_load_manager) {
+      //if( counter++ % 5 == 0){
+          console.log("runEveryTwoMinutes - loading_active: "+ loading_active + "; start_load_manager: " + start_load_manager);
+      //}
+      return;
+  }
+  checkToStartCharging();
+};
+
 /** in case the car is active in the local WiFi start the manager routine */
 on({id: FRITZBOX_TESLA_WLAN_ACTIVE, val: true}, async function (obj) {
-  if(loading_active || !start_load_manager)
-    return;
+  if(loading_active || !start_load_manager) {
+      return;
+  }
+  checkToStartCharging();
+});
 
-  if (getState(FRITZBOX_TESLA_WLAN_ACTIVE).val) {
-    console.log('Tesla is active in the local wifi.');
-    if (getState( DATA_POINT_TESLA_CHARGE_CABEL).val == 'IEC') {
-      console.log('The car is connected to a cable.');
-      if (getState( DATA_POINT_TESLA_CHARGING_STATE).val != 'Complete') {
+/** in case the car is NOT active in the local WiFi... */
+on({id: FRITZBOX_TESLA_WLAN_ACTIVE, val: false}, async function (obj) {
+  loading_active = false;
+});
+
+function checkToStartCharging() {
+    if(checkIfCarIsPresent() && checkCableIsIEC(true)) {
+        tryToStartCharging();
+    }
+}
+
+function checkIfCarIsPresent() {
+    return getState(FRITZBOX_TESLA_WLAN_ACTIVE).val;
+}
+
+function checkCableIsIEC(log_output) {
+    var cableType = getState( DATA_POINT_TESLA_CHARGE_CABEL).val;
+    if(log_output){
+        console.log('Cable type connected to car: ' + cableType);
+    }
+    
+    return 'IEC' == cableType;
+}
+
+function checkCancelCharging(log_output) {
+    if(!loading_active) {
+        console.log("charging is not active.");
+        return true;
+    }
+
+    if(!checkCableIsIEC(log_output)) {
+        console.log("cable is not connected to wallbox.");
+        loading_active = false;
+        return true;
+    }
+    return false;
+}
+
+async function tryToStartCharging() {
+    console.log('lets try to start charging');
+    if (getState( DATA_POINT_TESLA_CHARGING_STATE).val != 'Complete') {
         console.log('There is some space in the battery to fill.');
         if (!loading_active) {
           loading_active = true;
@@ -112,9 +167,7 @@ on({id: FRITZBOX_TESLA_WLAN_ACTIVE, val: true}, async function (obj) {
       } else {
         console.log('Battery is fully charged!');
       }
-    }
-  }
-});
+}
 
 /**
  * Start loading the Tesla and continuously change the power to reflect the available power.
@@ -129,6 +182,13 @@ async function startLoading() {
   startup_turns = 0;
 
   interval = setInterval(async function () {
+      if(checkCancelCharging(false)){
+          if (interval) {
+              clearInterval(interval);
+              interval = null;
+            }
+          return;
+      }
     current_power = getState(DATA_POINT_INVERTER_ACTIVE_POWER).val;
     power_available = getState(DATA_POINT_METER_ACTIVE_POWER).val;
 
@@ -139,7 +199,7 @@ async function startLoading() {
         current_charge_amps = getState(DATA_POINT_TESLA_CHARGE_AMPS).val;
         console.log( "current AMPS " + current_charge_amps );
 
-      if (current_charge_amps == 0) {
+      if (current_charge_amps == 0 || getState( DATA_POINT_TESLA_CHARGING_STATE).val != "Charging") {
         console.log('Try to start charging.');
         getState(CONTROL_TESLA_CHARGE_START, function (err, state) {
             setStateDelayed(CONTROL_TESLA_CHARGE_START, state ? !state.val : true, 1000, false);
@@ -165,7 +225,9 @@ async function startLoading() {
             new_charge_amps = current_charge_amps - over_amps;
         } else {
             new_charge_amps = current_charge_amps-1;
-        }        
+        }
+
+        new_charge_amps = KEEP_MINIMUM_AMPS != 0 && KEEP_MINIMUM_AMPS > new_charge_amps ? KEEP_MINIMUM_AMPS : new_charge_amps;
       }
 
       if (new_charge_amps != current_charge_amps) {
@@ -208,4 +270,3 @@ async function startLoading() {
     
   }, POLL_INTERVAL);
 }
-
